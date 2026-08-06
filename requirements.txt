@@ -1,0 +1,26 @@
+# STAMP Dependencies
+
+# Core Deep Learning
+torch>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Vision and Video Processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Transformers and CLIP
+transformers>=4.35.0
+clip @ git+https://github.com/openai/CLIP.git
+
+# Utilities
+tqdm>=4.65.0
+einops>=0.7.0
+pandas>=2.0.0
+
+# Logging
+tensorboard>=2.14.0
+
+# Optional
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
