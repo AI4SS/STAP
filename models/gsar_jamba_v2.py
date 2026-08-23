@@ -118,16 +118,16 @@ class RobustAnchorAggregation(nn.Module):
 
 class LocalDynamicAdaptiveSSM(nn.Module):
     """
-    改进点3: 局部时序动态感知的自适应Δ
+    改进点3: 局部时序动态感知的自适应Δ (论文公式严格版)
     
-    核心学术创新点:
-    摒弃原方案"全局锚点微弱偏置"的弱自适应，改为基于局部时序上下文的强自适应机制。
+    论文公式:
+        Δ_t = Δ_base + α·Sim(g_anchor, x_t) + ρ·w_t
     
-    SSM数学原理:
-    h(t) = A^Δ_t * h(t-1) + B*Δ_t * x(t)
-    
-    - Δ_t ↑ → A^Δ_t ↓ (历史快速遗忘) → 聚焦当前帧细节
-    - Δ_t ↓ → A^Δ_t ↑ (历史高度保留) → 依赖历史上下文
+    其中:
+        - Δ_base: 由 Mamba 自身的 x_proj/dt_proj 产生
+        - Sim(g_anchor, x_t): 全局语义锚点与当前帧特征的余弦相似度
+        - w_t: 帧级重要性分数 (importance_scores)
+        - α, ρ: 可学习标量 (初始为负，使高显著帧对应更小的 Δ_t)
     """
     
     def __init__(
@@ -138,8 +138,8 @@ class LocalDynamicAdaptiveSSM(nn.Module):
         expand: int = 2,
         dt_rank: int = 48,
         dropout: float = 0.1,
-        delta_min: float = 0.01,
-        delta_max: float = 1.0,
+        alpha: float = -0.1,
+        rho: float = -0.1,
     ):
         super().__init__()
         self.d_model = d_model
@@ -149,8 +149,9 @@ class LocalDynamicAdaptiveSSM(nn.Module):
         self.d_inner = d_model * expand
         self.dt_rank = dt_rank
         
-        self.delta_min = nn.Parameter(torch.tensor(delta_min))
-        self.delta_max = nn.Parameter(torch.tensor(delta_max))
+        # 论文中的 α 和 ρ (可学习标量，允许学习负值)
+        self.alpha = nn.Parameter(torch.tensor(alpha))
+        self.rho = nn.Parameter(torch.tensor(rho))
         
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
         
@@ -165,9 +166,6 @@ class LocalDynamicAdaptiveSSM(nn.Module):
         self.x_proj = nn.Linear(self.d_inner, dt_rank + d_state * 2, bias=False)
         self.dt_proj = nn.Linear(dt_rank, self.d_inner, bias=True)
         
-        self.local_dynamic_proj1 = nn.Linear(d_model * 2 + 1, dt_rank)
-        self.local_dynamic_proj2 = nn.Linear(dt_rank, 1)
-        
         A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
         self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.d_inner))
@@ -180,20 +178,20 @@ class LocalDynamicAdaptiveSSM(nn.Module):
     def _init_weights(self):
         nn.init.xavier_uniform_(self.in_proj.weight)
         nn.init.xavier_uniform_(self.x_proj.weight)
-        nn.init.xavier_uniform_(self.local_dynamic_proj1.weight)
-        nn.init.xavier_uniform_(self.local_dynamic_proj2.weight)
         nn.init.constant_(self.dt_proj.bias, 1.0)
     
     def forward(
         self,
         x: torch.Tensor,
         importance_scores: torch.Tensor,
+        g_anchor: torch.Tensor,
         prev_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (B, T, D) 输入序列
-            importance_scores: (B, T) 帧级重要性分数
+            importance_scores: (B, T) 帧级重要性分数 w_t
+            g_anchor: (B, D) 全局语义锚点
             prev_states: 可选的前一Block的状态
         
         Returns:
@@ -210,28 +208,32 @@ class LocalDynamicAdaptiveSSM(nn.Module):
         x_conv = rearrange(x_conv, 'b n l -> b l n')
         x_conv = F.silu(x_conv)
         
-        delta_x = torch.zeros_like(x)
-        delta_x[:, 1:, :] = x[:, 1:, :] - x[:, :-1, :]
-        delta_x_abs = torch.abs(delta_x)
-        
-        local_context = torch.cat([
-            delta_x,
-            delta_x_abs,
-            importance_scores.unsqueeze(-1),
-        ], dim=-1)
-        
-        local_hidden = F.relu(self.local_dynamic_proj1(local_context))
-        local_significance = torch.sigmoid(self.local_dynamic_proj2(local_hidden)).squeeze(-1)
-        
-        delta_min_val = torch.clamp(F.softplus(self.delta_min), min=0.001, max=0.5)
-        delta_max_val = torch.clamp(F.softplus(self.delta_max), min=0.5, max=2.0)
-        
+        # Mamba自身产生 Δbase、B、C
         x_ssm = self.x_proj(x_conv)
-        delta_base, B_ssm, C = torch.split(x_ssm, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         
-        delta_adaptive = delta_min_val + (delta_max_val - delta_min_val) * local_significance.unsqueeze(-1)
+        delta_base_raw, B_ssm, C = torch.split(
+            x_ssm,
+            [self.dt_rank, self.d_state, self.d_state],
+            dim=-1,
+        )
         
-        delta = self.dt_proj(delta_base + delta_adaptive)
+        # Δbase
+        delta_base = self.dt_proj(delta_base_raw)
+        
+        # Sim(g_anchor, x_t)
+        anchor_similarity = F.cosine_similarity(
+            x,
+            g_anchor.unsqueeze(1),
+            dim=-1
+        )
+        
+        # Δ_t = Δ_base + α·Sim(g_anchor, x_t) + ρ·w_t
+        delta = (
+            delta_base
+            + self.alpha * anchor_similarity.unsqueeze(-1)
+            + self.rho * importance_scores.unsqueeze(-1)
+        )
+        
         delta = F.softplus(delta)
         
         A = -torch.exp(self.A_log.float())
@@ -581,6 +583,8 @@ class GSARJambaBlockV2(nn.Module):
         dt_rank: int = 48,
         delta_min: float = 0.01,
         delta_max: float = 1.0,
+        alpha: float = -0.1,
+        rho: float = -0.1,
         dropout: float = 0.1,
         use_sparse_attention: bool = True,
         use_ssm: bool = True,
@@ -601,8 +605,8 @@ class GSARJambaBlockV2(nn.Module):
             expand=expand,
             dt_rank=dt_rank,
             dropout=dropout,
-            delta_min=delta_min,
-            delta_max=delta_max,
+            alpha=alpha,
+            rho=rho,
         )
         
         self.attention = AnchorFusedDynamicWindowAttention(
@@ -651,7 +655,7 @@ class GSARJambaBlockV2(nn.Module):
         
         # SSM消融: 如果禁用SSM，使用零向量替代
         if self.use_ssm:
-            y_temporal, ssm_final_state = self.ssm(x_norm, importance_scores)
+            y_temporal, ssm_final_state = self.ssm(x_norm, importance_scores, g_anchor)
         else:
             # 使用零向量替代SSM输出
             B, T, D = x_norm.shape
@@ -725,6 +729,8 @@ class GSARJambaEncoderV2(nn.Module):
         dt_rank: int = 48,
         delta_min: float = 0.01,
         delta_max: float = 1.0,
+        alpha: float = -0.1,
+        rho: float = -0.1,
         dropout: float = 0.1,
         max_frames: int = 100,
         use_frame_scoring: bool = True,
@@ -761,6 +767,8 @@ class GSARJambaEncoderV2(nn.Module):
                 dt_rank=dt_rank,
                 delta_min=delta_min,
                 delta_max=delta_max,
+                alpha=alpha,
+                rho=rho,
                 dropout=dropout,
                 use_sparse_attention=use_sparse_attention,
                 use_ssm=use_ssm,
@@ -834,6 +842,8 @@ def create_gsar_jamba_encoder_v2(
     dt_rank: int = 48,
     delta_min: float = 0.01,
     delta_max: float = 1.0,
+    alpha: float = -0.1,
+    rho: float = -0.1,
     dropout: float = 0.1,
     use_frame_scoring: bool = True,
     use_sparse_attention: bool = True,
@@ -853,6 +863,8 @@ def create_gsar_jamba_encoder_v2(
         dt_rank=dt_rank,
         delta_min=delta_min,
         delta_max=delta_max,
+        alpha=alpha,
+        rho=rho,
         dropout=dropout,
         max_frames=num_frames,
         use_frame_scoring=use_frame_scoring,
