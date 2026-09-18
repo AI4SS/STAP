@@ -314,6 +314,18 @@ def load_labels_and_user_features(comment_file, titles_file, video_ids, category
     """
     加载标签和安全特征
     标签: log2(comment_count)
+        【论文笔误说明 / Note on a typo in the paper】
+        论文正文中把预测目标写成了 views（播放量），但本仓库实际使用的是评论数
+        comments，即这里的 label = log2(comment_count + 1)。
+        这与已有工作的定义完全一致：ICPF 在其 retriever/Readme.md 中明确写道
+        "The label popularity here is defined as the number of total comments for
+        a micro-video"（https://github.com/Jolieresearch/ICPF/blob/main/retriever/Readme.md），
+        本文沿用同一标签定义，因此与基线及同类方法的对比属于同标签、同口径，
+        不存在公平性问题。
+        (The paper mistakenly says "views"; we actually predict the number of
+        comments, exactly as defined in prior work — cf. ICPF retriever/Readme.md:
+        "The label popularity here is defined as the number of total comments for
+        a micro-video". Hence all comparisons are like-for-like and fair.)
     安全特征: title_length, title_words, has_special, has_numbers, avg_word_len, category
     """
     print("\n" + "=" * 60)
